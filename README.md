@@ -1,9 +1,15 @@
-# anicli-ru
+# anicli-ru (fork)
 
 ---
 
-CLI приложение и локальный вебсервер для поиска и просмотра аниме из терминала с русской озвучкой или субтитрами.
-Поддерживает unix, linux, windows 10/11 (через windows terminal)
+Форк [vypivshiy/ani-cli-ru](https://github.com/vypivshiy/ani-cli-ru) — CLI приложение и локальный вебсервер для поиска и просмотра аниме из терминала с русской озвучкой или субтитрами.
+Поддерживает unix, linux, windows 10/11 (через windows terminal).
+
+### Отличия форка
+- **Интерактивный интерфейс со стрелками (`anicli-ru` без аргументов):** выбор источника, поиск, онгоинги, серии, плеер/озвучка и фильтрация списков вводом текста. Весь классический CLI (`anicli-ru cli ...`, `web`, `version`) сохранён.
+- **Продолжение просмотра по таймкоду:** автоматическое сохранение позиции и длительности из `mpv` каждые 2 секунды, прогресс по каждой серии отдельно, стартовый пункт «Continue watching» и явный выбор между «Продолжить с MM:SS» и «Следующая серия» (без автопропуска — подходит и для фильмов).
+- **Меню после серии со стрелками:** следующая/предыдущая серия, продолжить с сохранённого времени, повтор с начала, выбор серии, смена плеера/озвучки с сохранением позиции.
+- **Встроенный источник `animeon` (`animeon.cc`):** поставляется прямо в клиенте, при этом остальные источники продолжают обновляться из оригинального `anicli-api`.
 
 ## Demonstration
 CLI:
@@ -35,24 +41,37 @@ https://github.com/user-attachments/assets/d8bf90aa-a2df-48fe-a625-5e3a30a5cf67
 ## Установка
 
 - Требуется python 3.9 или выше
-- Для CLI требуется [mpv видеоплеер](https://github.com/mpv-player/mpv)
-- Проект поставляется через pip, рекомендуется устанавливать через [uv](https://docs.astral.sh/uv/guides/tools/#installing-tools) или [pipx](pipx.pypa.io/latest/getting-started/)
+- Для CLI требуется [mpv видеоплеер](https://github.com/mpv-player/mpv) (должен быть в `PATH`)
+- Рекомендуется устанавливать через [uv](https://docs.astral.sh/uv/guides/tools/#installing-tools) или [pipx](https://pipx.pypa.io/latest/getting-started/) напрямую из этого репозитория:
 - Минимальная установка, только CLI клиент
-    - UV - `uv tool install anicli-ru` (рекомендуется)
-    - PIPX - `pipx install anicli-ru`
+    - UV (рекомендуется):
+      ```shell
+      uv tool install "git+https://github.com/CHUPAKABRA8/ani-cli-ru.git"
+      ```
+    - PIPX:
+      ```shell
+      pipx install "git+https://github.com/CHUPAKABRA8/ani-cli-ru.git"
+      ```
 
 ### Опциональные зависимости:
 
 - Установка всех зависимостей (CLI + webserver + browser cookie extractor)
-    - `uv tool install anicli-ru[all]`
-    - `pipx install anicli-ru[all]`
+    - UV: `uv tool install "anicli-ru[all] @ git+https://github.com/CHUPAKABRA8/ani-cli-ru.git"`
+    - PIPX: `pipx install "anicli-ru[all] @ git+https://github.com/CHUPAKABRA8/ani-cli-ru.git"`
 
 - Извлечение cookies из браузера в клиент (используется для редкого обхода ddos-guard/cloudflare, требуется зависимость [rookiepy](https://github.com/thewh1teagle/rookie))
-    - `uv tool install anicli-ru[cookies]`
-    - `pipx install anicli-ru[cookies]`
+    - UV: `uv tool install "anicli-ru[cookies] @ git+https://github.com/CHUPAKABRA8/ani-cli-ru.git"`
+    - PIPX: `pipx install "anicli-ru[cookies] @ git+https://github.com/CHUPAKABRA8/ani-cli-ru.git"`
+
 - Локальный веб клиент
-    - `uv tool install anicli-ru[web]`
-    - `pipx install anicli-ru[cookies]`
+    - UV: `uv tool install "anicli-ru[web] @ git+https://github.com/CHUPAKABRA8/ani-cli-ru.git"`
+    - PIPX: `pipx install "anicli-ru[web] @ git+https://github.com/CHUPAKABRA8/ani-cli-ru.git"`
+
+### Обновление форка и парсеров (`anicli-api`):
+
+```shell
+uv tool install --force --upgrade "anicli-ru[cookies] @ git+https://github.com/CHUPAKABRA8/ani-cli-ru.git"
+```
 
 - termux webclient (TODO, untested)
 
