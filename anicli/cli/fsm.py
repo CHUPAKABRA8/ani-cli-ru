@@ -27,6 +27,58 @@ CONSOLE = get_console()
 T = TypeVar("T", bound=Context)
 
 
+async def _arrow_menu(title: str, options: list, default: int = 0):
+    """Arrow keys + Enter menu. options: list of (key, label). Returns key or None (Esc/q)."""
+    from prompt_toolkit.application import Application
+    from prompt_toolkit.formatted_text import FormattedText
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout import Layout
+    from prompt_toolkit.layout.containers import Window
+    from prompt_toolkit.layout.controls import FormattedTextControl
+
+    state = {"i": default}
+    kb = KeyBindings()
+
+    @kb.add("up")
+    @kb.add("left")
+    @kb.add("k")
+    def _up(event):
+        state["i"] = (state["i"] - 1) % len(options)
+
+    @kb.add("down")
+    @kb.add("right")
+    @kb.add("j")
+    def _down(event):
+        state["i"] = (state["i"] + 1) % len(options)
+
+    @kb.add("enter")
+    def _enter(event):
+        event.app.exit(result=options[state["i"]][0])
+
+    @kb.add("escape", eager=True)
+    @kb.add("q")
+    @kb.add("c-c")
+    def _esc(event):
+        event.app.exit(result=None)
+
+    def render():
+        out = [("bold", title + "\n")]
+        for n, (_, label) in enumerate(options):
+            if n == state["i"]:
+                out.append(("reverse bold", f" > {label} \n"))
+            else:
+                out.append(("", f"   {label} \n"))
+        out.append(("italic", "arrows: move, Enter: select, Esc: back"))
+        return FormattedText(out)
+
+    app = Application(
+        layout=Layout(Window(FormattedTextControl(render), always_hide_cursor=True)),
+        key_bindings=kb,
+        full_screen=False,
+    )
+    return await app.run_async()
+
+
 class BaseAnimeFSM(BaseFSM[T]):
     ROUTE_NAME = "base"
 
@@ -171,12 +223,72 @@ class BaseAnimeFSM(BaseFSM[T]):
             f"{episode.ordinal} {episode.title}",
         )
 
-        await MPVController(
-            [video_candidate],
-            [title],
-            mpv_opts=opts,
-            save_time=True,
-        ).play()
+        episodes_all = self.ctx["episodes"]  # type: ignore
+        cur_idx = ep_num
+        cur_source = source
+        cur_video = video_candidate
+        cur_title = title
+        while True:
+            await MPVController(
+                [cur_video],
+                [cur_title],
+                mpv_opts=opts,
+                save_time=True,
+            ).play()
+
+            # post-play menu (arrows + Enter): next / replay / previous / back
+            has_next = cur_idx + 1 < len(episodes_all)
+            has_prev = cur_idx > 0
+            options = []
+            if has_next:
+                options.append(("n", "Next episode"))
+            options.append(("r", "Replay"))
+            if has_prev:
+                options.append(("p", "Previous episode"))
+            options.append(("b", "Back"))
+            try:
+                choice = await _arrow_menu(cur_title, options, 0)
+            except (EOFError, KeyboardInterrupt):
+                choice = None
+            if choice is None:
+                choice = "b"
+            if choice in ("b", "back", "q", "quit"):
+                break
+            if choice in ("r", "replay"):
+                continue
+            if choice in ("n", "next", "p", "prev") :
+                step = 1 if choice in ("n", "next") else -1
+                new_idx = cur_idx + step
+                if not (0 <= new_idx < len(episodes_all)):
+                    CONSOLE.print("[red]no such episode[/red]")
+                    continue
+                new_ep = episodes_all[new_idx]
+                new_sources = await new_ep.a_get_sources()
+                if not new_sources:
+                    CONSOLE.print("[red]not available sources[/red]")
+                    continue
+                # keep same dub/source title if possible
+                new_source = next(
+                    (s for s in new_sources if s.title == cur_source.title),
+                    new_sources[value] if value < len(new_sources) else new_sources[0],
+                )
+                new_videos = await new_source.a_get_videos()
+                if not new_videos:
+                    CONSOLE.print("[red]video not founded[/red]")
+                    continue
+                cur_idx = new_idx
+                cur_source = new_source
+                cur_video = get_video_by_quality(cast(List["Video"], new_videos), default_quality)
+                cur_title = f"{anime.title} - {new_ep.ordinal} {new_ep.title}"
+                self.ctx["episodes_num"] = new_idx  # type: ignore
+                history.save(
+                    result,
+                    extractor_name,
+                    {f"{new_ep.ordinal} {new_ep.title}": new_source},
+                    f"{new_ep.ordinal} {new_ep.title}",
+                )
+                continue
+            CONSOLE.print("[red]unknown choice[/red]")
 
         await self.go_back()
 
@@ -295,14 +407,14 @@ class HistoryFSM(BaseAnimeFSM[HistoryContext]):
         index = int(user_input)
 
         history_data = history.read()[index - 1]
-        time = history_data["time"]
-        if time is not None:
-            minutes, seconds = divmod(time, 60)
+        time = history_data.get("time")
+        ep_name = history.clean_episode_name(history_data)
+        if time is not None and time > 0:
             continue_ep = input(
-                f"Do you want to continue ep {history_data['episode']} at {minutes:02d}:{seconds:02d}\n(y/n): "
+                f"Do you want to continue ep {ep_name} at {history.format_time(time)}\n(y/n): "
             )
             if continue_ep == "y":
-                source = history.load_source(history_data, history_data["episode"])
+                source = history.load_source(history_data, ep_name)
                 default_quality = self.ctx["default_quality"]  # type: ignore
                 videos = await source.a_get_videos()
                 if not videos:
@@ -311,12 +423,13 @@ class HistoryFSM(BaseAnimeFSM[HistoryContext]):
                     return
                 videos = cast(List["Video"], videos)
                 video_candidate = get_video_by_quality(videos, default_quality)
-                opts = self.ctx["mpv_opts"] + f"--start={time}"  # type: ignore
+                history.bump_to_top(index - 1)
                 await MPVController(
                     [video_candidate],
-                    [history_data["episode"]],
-                    mpv_opts=opts,
+                    [ep_name],
+                    mpv_opts=self.ctx["mpv_opts"],  # type: ignore
                     save_time=True,
+                    start_time=time,
                 ).play()
 
         # transform human index to python

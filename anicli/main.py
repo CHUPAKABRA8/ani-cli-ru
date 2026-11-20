@@ -28,6 +28,16 @@ app = typer.Typer(
 )
 
 BROWSER_CHOICE = Choice(BROWSER_SUPPORTS)
+
+@app.callback(invoke_without_command=True)
+def _default(ctx: typer.Context):
+    """Without a subcommand: interactive arrow-key wizard."""
+    if ctx.invoked_subcommand is None:
+        from .wizard import run_wizard  # noqa
+
+        run_wizard()
+
+
 console = get_console()
 
 

@@ -72,7 +72,7 @@ class MpvIpcClient:
             line = await self.reader.readline()
 
         if line:
-            return json.loads(line.decode())
+            return json.loads(line.decode("utf-8", errors="ignore"))
 
     async def read(self):
         line = None
@@ -83,7 +83,7 @@ class MpvIpcClient:
             line = await self.reader.readline()
 
         if line:
-            return json.loads(line.decode())
+            return json.loads(line.decode("utf-8", errors="ignore"))
 
     def _windows_read(self):
         try:
@@ -99,7 +99,17 @@ class MpvIpcClient:
                 with open(self.socket_path, "w+b", buffering=0) as f:
                     f.write(json.dumps(command).encode() + b"\n")
                     f.flush()
-                    return f.readline()
+                    for _ in range(5):
+                        line = f.readline()
+                        if not line:
+                            return None
+                        try:
+                            data = json.loads(line.decode("utf-8", errors="ignore"))
+                        except Exception:
+                            continue
+                        if isinstance(data, dict) and "error" in data:
+                            return line
+                    return None
         except Exception:
             return None
 
@@ -112,11 +122,17 @@ class MPVController:
         *,
         mpv_opts: str = "",
         save_time: bool = False,
+        start_time: Optional[int] = None,
     ):
         self.videos = videos
         self.titles = titles
         self.mpv_opts = mpv_opts
         self.save_time = save_time
+        self.start_time: Optional[int] = (
+            int(start_time) if (start_time is not None and start_time > 0) else None
+        )
+        self.last_time: Optional[int] = self.start_time
+        self.last_duration: Optional[int] = None
 
         self.ipc: Optional[MpvIpcClient] = None
         self.ipc_socket: Optional[str] = None
@@ -137,12 +153,14 @@ class MPVController:
                 args.extend(self._build_args(headers))
             if self.mpv_opts:
                 args.extend(shlex.split(self.mpv_opts))
+            if self.start_time:
+                args.append(f"--start={self.start_time}")
 
             args.append(f"--input-ipc-server={self.ipc_socket}")
 
             if len(self.videos) == 1:
                 title = sanitize_filename(self.titles[0])
-                args.extend([f"{TITLE_KEY}={title}", first_vid.url])
+                args.extend([f"{TITLE_KEY}={title}", f"--force-media-title={title}", first_vid.url])
                 await self._run_player(args)
                 return
 
@@ -161,35 +179,62 @@ class MPVController:
                 if p.exists():
                     p.unlink()
 
-    async def _monitor_time(self, interval: int = 10):
+    async def _monitor_time(self, interval: float = 2.0):
         if self.ipc:
+            is_playlist = len(self.videos) > 1
             last_title = None
-            last_time = None
+            last_time: Optional[int] = None
+            last_duration: Optional[int] = None
+            await asyncio.sleep(interval)
             while True:
                 try:
-                    # title handler
-                    title = await self.get_title()
-                    if title != last_title:
-                        last_title = title
-                        history.update_last({"episode": title})
+                    # title handler (playlist only; skip raw m3u8 manifest names)
+                    if is_playlist:
+                        title = await self.get_title()
+                        if title and ".m3u8" not in str(title) and title != last_title:
+                            last_title = title
+                            last_duration = None
+                            history.update_progress(last_time, duration=None, episode=str(title))
 
                     # time handler
                     if self.ipc:
                         time_resp = await self.ipc.send(
                             {"command": ["get_property", "time-pos"]}
                         )
-                        if time_resp:
-                            try:
-                                t = int(time_resp.get("data"))
-                                if t != last_time:
-                                    last_time = t
-                                    history.update_last({"time": t})
-                            except (TypeError, ValueError):
-                                pass
+                        if isinstance(time_resp, dict) and time_resp.get("error") == "success":
+                            raw_t = time_resp.get("data")
+                            if isinstance(raw_t, (int, float)) and raw_t >= 0:
+                                t = int(raw_t)
+                                if not (
+                                    self.start_time
+                                    and self.start_time > 5
+                                    and t == 0
+                                    and last_time is None
+                                ):
+                                    if t != last_time:
+                                        last_time = t
+                                        self.last_time = t
+                                        history.update_progress(t, duration=last_duration)
+
+                        if last_duration is None:
+                            dur_resp = await self.ipc.send(
+                                {"command": ["get_property", "duration"]}
+                            )
+                            if isinstance(dur_resp, dict) and dur_resp.get("error") == "success":
+                                raw_d = dur_resp.get("data")
+                                if isinstance(raw_d, (int, float)) and raw_d > 0:
+                                    last_duration = int(raw_d)
+                                    self.last_duration = last_duration
+                                    history.update_progress(
+                                        last_time if last_time is not None else self.last_time,
+                                        duration=last_duration,
+                                    )
+
                     await asyncio.sleep(interval)
-                except Exception as e:
-                    print(e)
-                    await asyncio.sleep(1)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    await asyncio.sleep(1.0)
 
     async def get_title(self):
         if self.ipc:
