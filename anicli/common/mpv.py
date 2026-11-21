@@ -6,12 +6,14 @@ import platform
 import shlex
 import shutil
 import tempfile
+import time
 from asyncio.streams import StreamReader, StreamWriter, open_connection
 from asyncio.subprocess import create_subprocess_exec
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
 
 from anicli.common import history
+from anicli.common.discord_rpc import get_rpc
 from anicli.common.m3u import generate_m3u_str_playlist
 from anicli.common.sanitizer import sanitize_filename
 
@@ -123,6 +125,7 @@ class MPVController:
         mpv_opts: str = "",
         save_time: bool = False,
         start_time: Optional[int] = None,
+        rpc_meta: Optional[Dict[str, Any]] = None,
     ):
         self.videos = videos
         self.titles = titles
@@ -133,6 +136,7 @@ class MPVController:
         )
         self.last_time: Optional[int] = self.start_time
         self.last_duration: Optional[int] = None
+        self.rpc_meta = rpc_meta
 
         self.ipc: Optional[MpvIpcClient] = None
         self.ipc_socket: Optional[str] = None
@@ -185,6 +189,10 @@ class MPVController:
             last_title = None
             last_time: Optional[int] = None
             last_duration: Optional[int] = None
+            last_rpc_paused: Optional[bool] = False if self.rpc_meta else None
+            last_rpc_dur: Optional[int] = None
+            last_rpc_start: Optional[float] = None
+            last_rpc_ep: Optional[str] = str(self.rpc_meta.get("episode") or "") if self.rpc_meta else None
             await asyncio.sleep(interval)
             while True:
                 try:
@@ -192,11 +200,12 @@ class MPVController:
                     if is_playlist:
                         title = await self.get_title()
                         if title and ".m3u8" not in str(title) and title != last_title:
-                            last_title = title
+                            last_title = str(title)
                             last_duration = None
-                            history.update_progress(last_time, duration=None, episode=str(title))
+                            if self.save_time:
+                                history.update_progress(last_time, duration=None, episode=last_title)
 
-                    # time handler
+                    # time & duration handler
                     if self.ipc:
                         time_resp = await self.ipc.send(
                             {"command": ["get_property", "time-pos"]}
@@ -214,7 +223,8 @@ class MPVController:
                                     if t != last_time:
                                         last_time = t
                                         self.last_time = t
-                                        history.update_progress(t, duration=last_duration)
+                                        if self.save_time:
+                                            history.update_progress(t, duration=last_duration)
 
                         if last_duration is None:
                             dur_resp = await self.ipc.send(
@@ -225,10 +235,58 @@ class MPVController:
                                 if isinstance(raw_d, (int, float)) and raw_d > 0:
                                     last_duration = int(raw_d)
                                     self.last_duration = last_duration
-                                    history.update_progress(
-                                        last_time if last_time is not None else self.last_time,
-                                        duration=last_duration,
-                                    )
+                                    if self.save_time:
+                                        history.update_progress(
+                                            last_time if last_time is not None else self.last_time,
+                                            duration=last_duration,
+                                        )
+
+                        if self.rpc_meta:
+                            paused = last_rpc_paused if last_rpc_paused is not None else False
+                            pause_resp = await self.ipc.send(
+                                {"command": ["get_property", "pause"]}
+                            )
+                            if isinstance(pause_resp, dict) and pause_resp.get("error") == "success":
+                                if isinstance(pause_resp.get("data"), bool):
+                                    paused = pause_resp["data"]
+
+                            cur_ep = (
+                                last_title
+                                if (is_playlist and last_title)
+                                else str(self.rpc_meta.get("episode") or "")
+                            )
+                            cur_t = last_time if last_time is not None else self.last_time
+                            now = time.time()
+                            seeked = (
+                                (not paused)
+                                and (cur_t is not None)
+                                and (
+                                    last_rpc_start is None
+                                    or abs((now - last_rpc_start) - cur_t) > 3.5
+                                )
+                            )
+                            if (
+                                paused != last_rpc_paused
+                                or last_duration != last_rpc_dur
+                                or cur_ep != last_rpc_ep
+                                or seeked
+                            ):
+                                meta = dict(self.rpc_meta)
+                                meta["episode"] = cur_ep
+                                await get_rpc().a_set_watching(
+                                    **meta,
+                                    time_pos=cur_t,
+                                    duration=last_duration,
+                                    paused=paused,
+                                )
+                                last_rpc_paused = paused
+                                last_rpc_dur = last_duration
+                                last_rpc_ep = cur_ep
+                                last_rpc_start = (
+                                    (time.time() - cur_t)
+                                    if (not paused and cur_t is not None)
+                                    else None
+                                )
 
                     await asyncio.sleep(interval)
                 except asyncio.CancelledError:
@@ -259,7 +317,14 @@ class MPVController:
             print(f"Executing: {PLAYER} {' '.join(args)}")
             process = await create_subprocess_exec(PLAYER, *args)
 
-            if self.save_time:
+            if self.rpc_meta:
+                await get_rpc().a_set_watching(
+                    **self.rpc_meta,
+                    time_pos=self.start_time or 0,
+                    paused=False,
+                )
+
+            if self.save_time or self.rpc_meta:
                 if platform.system() != "Windows":
                     for _ in range(50):
                         if Path(self.ipc_socket).exists():
@@ -273,8 +338,8 @@ class MPVController:
                     monitor_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await monitor_task
-
-            await process.wait()
+            else:
+                await process.wait()
 
     def _build_args(self, headers: Dict[str, str]) -> List[str]:
         """Build shared mpv arguments for headers and extra options."""

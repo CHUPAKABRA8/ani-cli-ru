@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application
@@ -15,6 +15,7 @@ from prompt_toolkit.layout.controls import FormattedTextControl
 from rich import get_console
 
 from anicli.common import history
+from anicli.common.discord_rpc import get_rpc
 from anicli.common.extractors import dynamic_load_extractor_module, get_extractor_modules
 from anicli.common.mpv import MPVController, is_mpv_installed
 
@@ -193,6 +194,38 @@ def _make_extractor(name: str):
     return dynamic_load_extractor_module(name).Extractor()
 
 
+def _resolve_page_url(name: str, item: Any) -> Optional[str]:
+    raw = getattr(item, "url", "") or ""
+    if raw.startswith(("http://", "https://")):
+        return raw
+    if name == "animeon" and raw and raw != "_":
+        return f"https://animeon.cc/anime/{raw}"
+    return None
+
+
+def _build_rpc_meta(
+    name: str,
+    item: Any,
+    anime: Any,
+    ep: Any,
+    ep_idx: int,
+    episodes: Sequence[Any],
+    src: Any,
+    video: Any,
+) -> Dict[str, Any]:
+    return {
+        "anime_title": anime.title,
+        "episode": _ep_label(ep),
+        "episode_num": ep_idx + 1,
+        "total_episodes": len(episodes),
+        "dub": getattr(src, "title", None),
+        "source_name": name,
+        "thumbnail": getattr(anime, "thumbnail", None) or getattr(item, "thumbnail", None),
+        "quality": getattr(video, "quality", None),
+        "page_url": _resolve_page_url(name, item),
+    }
+
+
 async def _close(extractor) -> None:
     try:
         extractor.http.close()
@@ -341,8 +374,17 @@ async def _play_loop(
         else:
             CONSOLE.print(f"[bold]Playing:[/bold] {title} ({src})")
 
-        ctrl = MPVController([video], [title], mpv_opts=opts, save_time=True, start_time=eff_start)
+        rpc_meta = _build_rpc_meta(name, item, anime, ep, ep_idx, episodes, src, video)
+        ctrl = MPVController(
+            [video],
+            [title],
+            mpv_opts=opts,
+            save_time=True,
+            start_time=eff_start,
+            rpc_meta=rpc_meta,
+        )
         await ctrl.play()
+        await get_rpc().a_set_browsing(name)
 
         last_t = ctrl.last_time
         last_dur = ctrl.last_duration
@@ -452,10 +494,36 @@ async def _direct_source_fallback(entry: dict, index_in_history: int, opts: str)
         history.update_progress(0, duration=saved_dur)
 
     title = f"{title_anime} - {ep_name}"
+    ext_name = entry.get("extractor_name") or ""
+    data_obj = entry.get("data") or {}
+    raw_url = data_obj.get("url") or ""
+    if raw_url.startswith(("http://", "https://")):
+        page_url: Optional[str] = raw_url
+    elif ext_name == "animeon" and raw_url and raw_url != "_":
+        page_url = f"https://animeon.cc/anime/{raw_url}"
+    else:
+        page_url = None
+    rpc_meta: Dict[str, Any] = {
+        "anime_title": title_anime,
+        "episode": ep_name,
+        "dub": getattr(src, "title", None),
+        "source_name": ext_name or None,
+        "thumbnail": data_obj.get("thumbnail") or None,
+        "quality": getattr(video, "quality", None),
+        "page_url": page_url,
+    }
     while True:
         eff_start = start_time if (start_time is not None and start_time > 0) else None
-        ctrl = MPVController([video], [title], mpv_opts=opts, save_time=True, start_time=eff_start)
+        ctrl = MPVController(
+            [video],
+            [title],
+            mpv_opts=opts,
+            save_time=True,
+            start_time=eff_start,
+            rpc_meta=rpc_meta,
+        )
         await ctrl.play()
+        await get_rpc().a_set_browsing(ext_name or None)
         last_t = ctrl.last_time
         last_dur = ctrl.last_duration
         menu: List[Tuple[str, str]] = []
@@ -676,21 +744,26 @@ async def wizard(source: Optional[str] = None) -> None:
         return
 
     opts = ""
-    name = source
-    if name is None:
-        while True:
-            picked = await _choose_source_or_continue(None, allow_continue=True)
-            if picked is None:
-                return
-            if picked == "__continue__":
-                await _history_flow(opts)
-                continue
-            name = picked
-            break
-
-    extractor = _make_extractor(name)
+    extractor = None
     try:
+        name = source
+        if name is None:
+            await get_rpc().a_set_browsing(None)
+            while True:
+                picked = await _choose_source_or_continue(None, allow_continue=True)
+                if picked is None:
+                    return
+                if picked == "__continue__":
+                    await _history_flow(opts)
+                    await get_rpc().a_set_browsing(None)
+                    continue
+                name = picked
+                break
+
+        extractor = _make_extractor(name)
+        await get_rpc().a_set_browsing(name)
         while True:
+            rpc_label = f"Discord RPC: {'ON' if get_rpc().is_enabled() else 'OFF'}"
             choice = await pick(
                 f"anicli-ru   source: {name}",
                 [
@@ -699,6 +772,7 @@ async def wizard(source: Optional[str] = None) -> None:
                     ("h", "Continue watching (history)"),
                     ("c", "Change source"),
                     ("k", "Classic command console"),
+                    ("rpc", rpc_label),
                     ("x", "Exit"),
                 ],
                 0,
@@ -708,20 +782,33 @@ async def wizard(source: Optional[str] = None) -> None:
                 return
             if choice == "s":
                 await _search_flow(extractor, name, opts)
+                await get_rpc().a_set_browsing(name)
             elif choice == "o":
                 await _search_flow(extractor, name, opts, ongoing=True)
+                await get_rpc().a_set_browsing(name)
             elif choice == "h":
                 await _history_flow(opts)
+                await get_rpc().a_set_browsing(name)
             elif choice == "k":
                 await _run_classic(name, None)
+                await get_rpc().a_set_browsing(name)
             elif choice == "c":
                 new = await _choose_source_or_continue(name, allow_continue=False)
                 if new and new != name:
                     await _close(extractor)
                     name = new
                     extractor = _make_extractor(name)
+                    await get_rpc().a_set_browsing(name)
+            elif choice == "rpc":
+                enabled = get_rpc().toggle()
+                if enabled:
+                    await get_rpc().a_set_browsing(name)
+                else:
+                    await get_rpc().a_clear()
     finally:
-        await _close(extractor)
+        if extractor is not None:
+            await _close(extractor)
+        await get_rpc().a_close()
 
 
 def run_wizard(source: Optional[str] = None) -> None:

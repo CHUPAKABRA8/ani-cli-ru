@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, List, Tuple, TypeVar, Union, cast
+from typing import TYPE_CHECKING, List, Optional, Tuple, TypeVar, Union, cast
 from urllib.parse import urlsplit
 
 import attr
@@ -8,6 +8,7 @@ from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn
 
 from anicli.common import history
 from anicli.common.anicli_api_helpers import videos_iterator
+from anicli.common.discord_rpc import get_rpc
 from anicli.common.mpv import MPVController
 from anicli.common.utils import is_arabic_digit
 
@@ -25,6 +26,15 @@ if TYPE_CHECKING:
 CONSOLE = get_console()
 
 T = TypeVar("T", bound=Context)
+
+
+def _fsm_page_url(extractor_name: str, item) -> Optional[str]:
+    raw = getattr(item, "url", "") or ""
+    if raw.startswith(("http://", "https://")):
+        return raw
+    if extractor_name == "animeon" and raw and raw != "_":
+        return f"https://animeon.cc/anime/{raw}"
+    return None
 
 
 async def _arrow_menu(title: str, options: list, default: int = 0):
@@ -229,12 +239,26 @@ class BaseAnimeFSM(BaseFSM[T]):
         cur_video = video_candidate
         cur_title = title
         while True:
+            cur_ep = episodes_all[cur_idx]
+            rpc_meta = {
+                "anime_title": anime.title,
+                "episode": f"{cur_ep.ordinal} {cur_ep.title}".strip(),
+                "episode_num": cur_idx + 1,
+                "total_episodes": len(episodes_all),
+                "dub": getattr(cur_source, "title", None),
+                "source_name": extractor_name,
+                "thumbnail": getattr(anime, "thumbnail", None) or getattr(result, "thumbnail", None),
+                "quality": getattr(cur_video, "quality", None),
+                "page_url": _fsm_page_url(extractor_name, result),
+            }
             await MPVController(
                 [cur_video],
                 [cur_title],
                 mpv_opts=opts,
                 save_time=True,
+                rpc_meta=rpc_meta,
             ).play()
+            await get_rpc().a_clear()
 
             # post-play menu (arrows + Enter): next / replay / previous / back
             has_next = cur_idx + 1 < len(episodes_all)
@@ -362,12 +386,23 @@ class BaseAnimeFSM(BaseFSM[T]):
                 if counter % m3u_size == 0:
                     progress.stop()
                     CONSOLE.print(f"Running playlist batch {counter // m3u_size}")
+                    batch_rpc = {
+                        "anime_title": self.ctx["anime"].title,  # type: ignore
+                        "episode": playlist[0][1] if playlist else "",
+                        "dub": getattr(source, "title", None),
+                        "source_name": extractor_name,
+                        "thumbnail": getattr(self.ctx["anime"], "thumbnail", None) or getattr(result, "thumbnail", None),  # type: ignore
+                        "quality": getattr(video_candidate, "quality", None),
+                        "page_url": _fsm_page_url(extractor_name, result),
+                    }
                     await MPVController(
                         [v[0] for v in playlist],  # video
                         [v[1] for v in playlist],  # str title
                         mpv_opts=opts,
                         save_time=True,
+                        rpc_meta=batch_rpc,
                     ).play()
+                    await get_rpc().a_clear()
 
                     playlist.clear()
                     progress.start()
@@ -377,12 +412,23 @@ class BaseAnimeFSM(BaseFSM[T]):
             if playlist:
                 progress.stop()
                 CONSOLE.print("Running final playlist batch")
+                batch_rpc = {
+                    "anime_title": self.ctx["anime"].title,  # type: ignore
+                    "episode": playlist[0][1] if playlist else "",
+                    "dub": getattr(source, "title", None),
+                    "source_name": extractor_name,
+                    "thumbnail": getattr(self.ctx["anime"], "thumbnail", None) or getattr(result, "thumbnail", None),  # type: ignore
+                    "quality": getattr(video_candidate, "quality", None),
+                    "page_url": _fsm_page_url(extractor_name, result),
+                }
                 await MPVController(
                     [v[0] for v in playlist],  # video
                     [v[1] for v in playlist],  # str title
                     mpv_opts=opts,
                     save_time=True,
+                    rpc_meta=batch_rpc,
                 ).play()
+                await get_rpc().a_clear()
 
                 playlist.clear()
         await self.go_back()
@@ -424,13 +470,32 @@ class HistoryFSM(BaseAnimeFSM[HistoryContext]):
                 videos = cast(List["Video"], videos)
                 video_candidate = get_video_by_quality(videos, default_quality)
                 history.bump_to_top(index - 1)
+                data_obj = history_data.get("data") or {}
+                hist_ext = history_data.get("extractor_name") or ""
+                hist_url = data_obj.get("url") or ""
+                page_url = (
+                    hist_url
+                    if hist_url.startswith(("http://", "https://"))
+                    else (f"https://animeon.cc/anime/{hist_url}" if hist_ext == "animeon" and hist_url and hist_url != "_" else None)
+                )
+                hist_rpc = {
+                    "anime_title": data_obj.get("title") or ep_name,
+                    "episode": ep_name,
+                    "dub": getattr(source, "title", None),
+                    "source_name": hist_ext or None,
+                    "thumbnail": data_obj.get("thumbnail") or None,
+                    "quality": getattr(video_candidate, "quality", None),
+                    "page_url": page_url,
+                }
                 await MPVController(
                     [video_candidate],
                     [ep_name],
                     mpv_opts=self.ctx["mpv_opts"],  # type: ignore
                     save_time=True,
                     start_time=time,
+                    rpc_meta=hist_rpc,
                 ).play()
+                await get_rpc().a_clear()
 
         # transform human index to python
         result = self.ctx["results"][index - 1]  # type: ignore
